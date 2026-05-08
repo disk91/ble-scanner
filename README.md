@@ -1,5 +1,5 @@
 # ble-scanner
-Scan the BLE device around and track in/out
+Scan the BLE device around and track in/out - 100% vibe coded
 
 ## Install
 
