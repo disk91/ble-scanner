@@ -1,5 +1,7 @@
 # ble-scanner
 Scan the BLE device around and track in/out - 100% vibe coded
+Work on a RPI 2W with the native BLE adapter and also tested with TP-LINK UB500 Plus for long range coverage.
+RPI2W installed with ubuntu 26
 
 ## Install
 
