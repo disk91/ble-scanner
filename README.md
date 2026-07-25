@@ -11,8 +11,6 @@ sudo apt install -y python3 python3-venv python3-pip bluetooth bluez rfkill
 sudo systemctl enable --now bluetooth
 rfkill list
 sudo rfkill unblock bluetooth
-systemctl disable bluetooth
-systemctl stop bluetooth
 git clone https://github.com/disk91/ble-scanner.git
 cd ble-scanner
 python3 -m venv .venv
@@ -38,9 +36,8 @@ In `/etc/systemd/system/ble-daemon.service`
 [Unit]
 Description=BLE Presence Daemon
 # Démarre après que le réseau et BlueZ soient disponibles
-After=network.target bluetooth.target
-# Ne pas démarrer si bluetooth.service plante
-Wants=bluetooth.target
+After=network.target bluetooth.service
+Requires=bluetooth.service
 
 [Service]
 Type=simple
