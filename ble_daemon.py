@@ -332,35 +332,49 @@ class BLEPresenceDaemon:
                 await asyncio.sleep(self.watchdog_timeout - silence)
 
     async def _try_recover_adapter(self) -> bool:
-        """Tente de remonter l'adaptateur via hciconfig down/up.
-        Retourne True si la commande s'est exécutée sans erreur."""
+        """Tente de remonter l'adaptateur via hciconfig reset puis up.
+        Retourne True si l'adaptateur répond à nouveau, False sinon."""
         log.warning("Adapter %s disappeared — attempting soft reset", self.adapter)
 
-        for cmd in (
-            ["hciconfig", self.adapter, "down"],
-            ["hciconfig", self.adapter, "up"],
-        ):
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-                if proc.returncode != 0:
-                    log.warning(
-                        "hciconfig %s returned %d: %s",
-                        " ".join(cmd[1:]), proc.returncode, stderr.decode().strip(),
-                    )
-                    return False
-            except Exception:
-                log.exception("Failed to run %s", " ".join(cmd))
-                return False
+        # 'reset' fait down+up en une commande ; on ignore son code retour
+        # car l'adaptateur peut déjà être DOWN au niveau kernel (ce qui est normal).
+        await self._run_hci_cmd(["hciconfig", self.adapter, "reset"], ignore_failure=True)
+
+        # 'up' est la commande critique : si elle échoue, l'adaptateur est mort
+        ok = await self._run_hci_cmd(["hciconfig", self.adapter, "up"], ignore_failure=False)
+
+        if not ok:
+            log.error("hciconfig %s up failed — adapter unrecoverable this round", self.adapter)
+            return False
 
         # Laisse BlueZ le temps de ré-enregistrer l'adaptateur sur D-Bus
         await asyncio.sleep(3)
         log.info("Soft reset done, resuming scan")
         return True
+
+    async def _run_hci_cmd(self, cmd: list, ignore_failure: bool) -> bool:
+        """Exécute une commande hciconfig. Retourne True si succès (ou si ignore_failure)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+
+            if proc.returncode != 0:
+                msg = stderr.decode().strip()
+                if ignore_failure:
+                    log.debug("hciconfig %s returned %d (ignored): %s", " ".join(cmd[1:]), proc.returncode, msg)
+                else:
+                    log.error("hciconfig %s returned %d: %s", " ".join(cmd[1:]), proc.returncode, msg)
+                return ignore_failure
+
+            return True
+
+        except Exception:
+            log.exception("Failed to run %s", " ".join(cmd))
+            return ignore_failure
 
     async def _run_scanner_once(self, scanning_mode: str):
         """Lance le scanner et attend soit l'arrêt, soit un signal de restart.
