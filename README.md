@@ -44,8 +44,13 @@ Type=simple
 User=root
 WorkingDirectory=/home/ubuntu/ble-presence
 
-# Remonter hci0 avant de lancer le daemon, au cas où BlueZ l'aurait mis DOWN
-ExecStartPre=/usr/bin/hciconfig hci0 up
+# Débloque l'adaptateur si rfkill le bloque (ignore l'échec si rfkill absent)
+ExecStartPre=-/usr/sbin/rfkill unblock bluetooth
+# Remet hci0 UP (ignore l'échec si l'adaptateur est temporairement absent)
+ExecStartPre=-/usr/bin/hciconfig hci0 reset
+ExecStartPre=-/usr/bin/hciconfig hci0 up
+# Laisse 1s à BlueZ pour enregistrer l'adaptateur sur D-Bus après le up
+ExecStartPre=/bin/sleep 1
 
 ExecStart=/home/ubuntu/ble-presence/.venv/bin/python ble_daemon.py \
     --db /home/ubuntu/ble-presence/ble_presence.db \
