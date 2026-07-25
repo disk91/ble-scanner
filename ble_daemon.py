@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import signal
 import sqlite3
 import time
@@ -12,6 +13,15 @@ from typing import Dict, Optional
 from bleak import BleakScanner
 
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
+
+
+# ── Schema ───────────────────────────────────────────────────────────────────
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 
@@ -46,6 +56,9 @@ CREATE INDEX IF NOT EXISTS idx_presence_ts
 ON presence_events(ts);
 """
 
+# FIX 2 — Durée avant de supprimer un device absent des dicts en mémoire
+MEMORY_PURGE_AFTER = 3600.0  # 1 heure
+
 
 class BLEPresenceDaemon:
     def __init__(
@@ -56,6 +69,7 @@ class BLEPresenceDaemon:
         flush_interval: float,
         passive: bool,
         debug: bool,
+        watchdog_timeout: float,  # FIX 3
     ):
         self.db_path = db_path
         self.adapter = adapter
@@ -63,6 +77,7 @@ class BLEPresenceDaemon:
         self.flush_interval = flush_interval
         self.passive = passive
         self.debug = debug
+        self.watchdog_timeout = watchdog_timeout
 
         self.conn = sqlite3.connect(self.db_path)
         self.conn.executescript(SCHEMA)
@@ -77,6 +92,8 @@ class BLEPresenceDaemon:
         self.conn.execute("UPDATE devices SET is_present = 0, session_max_rssi = NULL")
         self.conn.commit()
 
+        # ── État en mémoire ───────────────────────────────────────────────
+        self.first_seen: Dict[str, float] = {}     # FIX 4 — heure réelle de première vue
         self.last_seen: Dict[str, float] = {}
         self.names: Dict[str, Optional[str]] = {}
         self.rssi: Dict[str, Optional[int]] = {}
@@ -87,6 +104,12 @@ class BLEPresenceDaemon:
 
         self.dirty = False
         self.stop_event = asyncio.Event()
+
+        # FIX 3 — Watchdog : timestamp du dernier callback + signal de restart
+        self.last_callback_ts: float = time.time()
+        self._need_restart = asyncio.Event()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def safe_migration(self, table: str, column: str, column_type: str):
         try:
@@ -100,18 +123,14 @@ class BLEPresenceDaemon:
     def encode_manufacturer_data(self, data) -> Optional[str]:
         if not data:
             return None
-
-        encoded = {}
-
-        for company_id, raw in data.items():
-            encoded[str(company_id)] = raw.hex()
-
-        return json.dumps(encoded, separators=(",", ":"))
+        return json.dumps(
+            {str(k): v.hex() for k, v in data.items()},
+            separators=(",", ":"),
+        )
 
     def encode_service_uuids(self, service_uuids) -> Optional[str]:
         if not service_uuids:
             return None
-
         return json.dumps(list(service_uuids), separators=(",", ":"))
 
     def insert_event(
@@ -127,162 +146,216 @@ class BLEPresenceDaemon:
         self.conn.execute(
             """
             INSERT INTO presence_events(
-                address,
-                name,
-                event_type,
-                ts,
-                rssi,
-                manufacturer_data,
-                service_uuids
+                address, name, event_type, ts, rssi, manufacturer_data, service_uuids
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                address,
-                name,
-                event_type,
-                ts,
-                rssi,
-                manufacturer_data,
-                service_uuids,
-            ),
+            (address, name, event_type, ts, rssi, manufacturer_data, service_uuids),
         )
-
         self.dirty = True
+
+    # ── Callback BLE ──────────────────────────────────────────────────────────
 
     def on_detected(self, device, adv_data):
-        ts = self.now()
+        # FIX 5 — Protéger le callback : une exception non catchée ici peut
+        #          faire taire silencieusement certaines versions de Bleak.
+        try:
+            ts = self.now()
+            self.last_callback_ts = ts  # FIX 3 — nourrir le watchdog
 
-        address = device.address
-        name = adv_data.local_name or device.name or self.names.get(address)
-        rssi = getattr(adv_data, "rssi", None)
+            address = device.address
+            name = adv_data.local_name or device.name or self.names.get(address)
+            rssi = getattr(adv_data, "rssi", None)
 
-        manufacturer_data = self.encode_manufacturer_data(
-            getattr(adv_data, "manufacturer_data", None)
-        )
-
-        service_uuids = self.encode_service_uuids(
-            getattr(adv_data, "service_uuids", None)
-        )
-
-        first_time_seen = address not in self.last_seen
-        was_present = self.present.get(address, False)
-
-        self.last_seen[address] = ts
-        self.names[address] = name
-        self.rssi[address] = rssi
-        self.present[address] = True
-
-        if manufacturer_data:
-            self.manufacturer_data[address] = manufacturer_data
-
-        if service_uuids:
-            self.service_uuids[address] = service_uuids
-
-        if rssi is not None:
-            current_max = self.session_max_rssi.get(address)
-
-            if current_max is None or rssi > current_max:
-                self.session_max_rssi[address] = rssi
-
-        if self.debug:
-            print(
-                {
-                    "address": address,
-                    "name": name,
-                    "rssi": rssi,
-                    "manufacturer_data": manufacturer_data,
-                    "service_uuids": service_uuids,
-                }
+            manufacturer_data = self.encode_manufacturer_data(
+                getattr(adv_data, "manufacturer_data", None)
+            )
+            service_uuids = self.encode_service_uuids(
+                getattr(adv_data, "service_uuids", None)
             )
 
-        self.dirty = True
+            first_time_seen = address not in self.last_seen
+            was_present = self.present.get(address, False)
 
-        if first_time_seen or not was_present:
-            self.insert_event(
-                address,
-                name,
-                "appeared",
-                ts,
-                rssi,
-                manufacturer_data,
-                service_uuids,
-            )
+            # FIX 4 — Enregistrer l'heure réelle de première détection
+            if first_time_seen:
+                self.first_seen[address] = ts
+
+            self.last_seen[address] = ts
+            self.names[address] = name
+            self.rssi[address] = rssi
+            self.present[address] = True
+
+            if manufacturer_data:
+                self.manufacturer_data[address] = manufacturer_data
+            if service_uuids:
+                self.service_uuids[address] = service_uuids
+
+            if rssi is not None:
+                current_max = self.session_max_rssi.get(address)
+                if current_max is None or rssi > current_max:
+                    self.session_max_rssi[address] = rssi
+
+            if self.debug:
+                log.debug("Detected: %s (%s) rssi=%s", address, name, rssi)
+
+            self.dirty = True
+
+            if first_time_seen or not was_present:
+                self.insert_event(
+                    address, name, "appeared", ts, rssi,
+                    manufacturer_data, service_uuids,
+                )
+
+        except Exception:
+            log.exception("Error in on_detected for %s", getattr(device, "address", "?"))
+
+    # ── Flush SQLite ──────────────────────────────────────────────────────────
 
     def flush_devices(self):
-        ts = self.now()
-
         for address, last_seen in self.last_seen.items():
-            name = self.names.get(address)
-            rssi = self.rssi.get(address)
-
             self.conn.execute(
                 """
                 INSERT INTO devices(
-                    address,
-                    name,
-                    first_seen,
-                    last_seen,
-                    last_rssi,
-                    is_present,
-                    session_max_rssi,
-                    manufacturer_data,
-                    service_uuids
+                    address, name, first_seen, last_seen, last_rssi,
+                    is_present, session_max_rssi, manufacturer_data, service_uuids
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-
                 ON CONFLICT(address) DO UPDATE SET
-                    name = COALESCE(excluded.name, devices.name),
-                    last_seen = excluded.last_seen,
-                    last_rssi = excluded.last_rssi,
-                    is_present = excluded.is_present,
+                    name             = COALESCE(excluded.name, devices.name),
+                    last_seen        = excluded.last_seen,
+                    last_rssi        = excluded.last_rssi,
+                    is_present       = excluded.is_present,
                     session_max_rssi = excluded.session_max_rssi,
                     manufacturer_data = COALESCE(excluded.manufacturer_data, devices.manufacturer_data),
-                    service_uuids = COALESCE(excluded.service_uuids, devices.service_uuids)
+                    service_uuids    = COALESCE(excluded.service_uuids, devices.service_uuids)
                 """,
                 (
                     address,
-                    name,
-                    ts,
+                    self.names.get(address),
+                    self.first_seen.get(address, last_seen),  # FIX 4
                     last_seen,
-                    rssi,
+                    self.rssi.get(address),
                     1 if self.present.get(address, False) else 0,
                     self.session_max_rssi.get(address),
                     self.manufacturer_data.get(address),
                     self.service_uuids.get(address),
                 ),
             )
-
         self.conn.commit()
         self.dirty = False
 
+    # FIX 2 — Purge mémoire ───────────────────────────────────────────────────
+
+    def purge_stale_memory(self):
+        """Supprime des dicts en mémoire les devices absents depuis plus de
+        MEMORY_PURGE_AFTER secondes, pour éviter la fuite mémoire."""
+        cutoff = self.now() - MEMORY_PURGE_AFTER
+
+        stale = [
+            addr for addr, ts in self.last_seen.items()
+            if ts < cutoff and not self.present.get(addr, False)
+        ]
+
+        for addr in stale:
+            for d in (
+                self.first_seen, self.last_seen, self.names, self.rssi,
+                self.present, self.session_max_rssi,
+                self.manufacturer_data, self.service_uuids,
+            ):
+                d.pop(addr, None)
+
+        if stale:
+            log.info("Purged %d stale device(s) from memory", len(stale))
+
+    # ── Boucles asynchrones ───────────────────────────────────────────────────
+
     async def disappearance_loop(self):
+        # FIX 1 — Le corps de la boucle est dans un try/except : une exception
+        #          SQLite (disque plein, lock…) ne tue plus la tâche silencieusement.
         while not self.stop_event.is_set():
-            ts = self.now()
+            try:
+                ts = self.now()
 
-            for address, is_present in list(self.present.items()):
-                if not is_present:
-                    continue
+                for address, is_present in list(self.present.items()):
+                    if not is_present:
+                        continue
 
-                last = self.last_seen.get(address, 0)
+                    last = self.last_seen.get(address, 0)
 
-                if ts - last >= self.lost_after:
-                    self.present[address] = False
+                    if ts - last >= self.lost_after:
+                        self.present[address] = False
+                        self.insert_event(
+                            address,
+                            self.names.get(address),
+                            "disappeared",
+                            last + self.lost_after,
+                            self.rssi.get(address),
+                            self.manufacturer_data.get(address),
+                            self.service_uuids.get(address),
+                        )
 
-                    self.insert_event(
-                        address,
-                        self.names.get(address),
-                        "disappeared",
-                        last + self.lost_after,
-                        self.rssi.get(address),
-                        self.manufacturer_data.get(address),
-                        self.service_uuids.get(address),
-                    )
+                if self.dirty:
+                    self.flush_devices()
 
-            if self.dirty:
-                self.flush_devices()
+                self.purge_stale_memory()  # FIX 2
+
+            except Exception:
+                log.exception("Error in disappearance_loop — continuing")
 
             await asyncio.sleep(self.flush_interval)
+
+    async def watchdog_loop(self):
+        # FIX 3 — Détecte le gel du scanner (plus aucun callback reçu depuis
+        #          watchdog_timeout secondes) et demande un restart.
+        await asyncio.sleep(self.watchdog_timeout)  # grâce initiale au démarrage
+
+        while not self.stop_event.is_set():
+            silence = self.now() - self.last_callback_ts
+
+            if silence >= self.watchdog_timeout:
+                log.warning(
+                    "No BLE callback for %.0fs — requesting scanner restart", silence
+                )
+                self._need_restart.set()
+                # Grâce après restart : on laisse le temps au scanner de revenir
+                await asyncio.sleep(self.watchdog_timeout)
+            else:
+                await asyncio.sleep(self.watchdog_timeout - silence)
+
+    async def _run_scanner_once(self, scanning_mode: str):
+        """Lance le scanner et attend soit l'arrêt, soit un signal de restart."""
+        self._need_restart.clear()
+
+        scanner = BleakScanner(
+            detection_callback=self.on_detected,
+            scanning_mode=scanning_mode,
+            bluez={"adapter": self.adapter},
+        )
+
+        try:
+            async with scanner:
+                log.info("Scanner running on %s", self.adapter)
+
+                stop_task = asyncio.create_task(self.stop_event.wait())
+                restart_task = asyncio.create_task(self._need_restart.wait())
+
+                _, pending = await asyncio.wait(
+                    [stop_task, restart_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+
+        except Exception:
+            log.exception("Scanner error on %s", self.adapter)
+
+    # ── Point d'entrée principal ──────────────────────────────────────────────
 
     async def run(self):
         loop = asyncio.get_running_loop()
@@ -292,27 +365,41 @@ class BLEPresenceDaemon:
 
         scanning_mode = "passive" if self.passive else "active"
 
-        scanner = BleakScanner(
-            detection_callback=self.on_detected,
-            scanning_mode=scanning_mode,
-            bluez={"adapter": self.adapter},
+        log.info("BLE daemon starting — adapter=%s mode=%s", self.adapter, scanning_mode)
+        log.info("Database: %s", self.db_path)
+        log.info(
+            "lost_after=%.0fs  flush_interval=%.0fs  watchdog_timeout=%.0fs",
+            self.lost_after, self.flush_interval, self.watchdog_timeout,
         )
 
-        print(f"BLE scan started on {self.adapter}")
-        print(f"Database: {self.db_path}")
-        print(f"Scanning mode: {scanning_mode}")
+        # FIX 1 — Les tâches background sont créées une seule fois et supervisées
+        disappearance_task = asyncio.create_task(self.disappearance_loop())
+        watchdog_task = asyncio.create_task(self.watchdog_loop())
 
-        async with scanner:
-            task = asyncio.create_task(self.disappearance_loop())
-            await self.stop_event.wait()
+        # FIX 3 — Boucle de restart du scanner
+        while not self.stop_event.is_set():
+            await self._run_scanner_once(scanning_mode)
+
+            if not self.stop_event.is_set():
+                log.info("Restarting scanner in 3s...")
+                await asyncio.sleep(3)
+
+        # ── Nettoyage ─────────────────────────────────────────────────────
+        for task in (disappearance_task, watchdog_task):
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         if self.dirty:
             self.flush_devices()
 
         self.conn.close()
-        print("Stopped.")
+        log.info("Stopped.")
 
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="BLE Presence Scanner")
@@ -323,8 +410,17 @@ def main():
     parser.add_argument("--flush-interval", type=float, default=5.0)
     parser.add_argument("--passive", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--watchdog-timeout",
+        type=float,
+        default=60.0,
+        help="Restart scanner if no BLE packet received for this many seconds (default: 60)",
+    )
 
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     daemon = BLEPresenceDaemon(
         db_path=Path(args.db),
@@ -333,6 +429,7 @@ def main():
         flush_interval=args.flush_interval,
         passive=args.passive,
         debug=args.debug,
+        watchdog_timeout=args.watchdog_timeout,
     )
 
     asyncio.run(daemon.run())
