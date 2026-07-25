@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from bleak import BleakScanner
+from bleak.exc import BleakError
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -58,6 +59,10 @@ ON presence_events(ts);
 
 # FIX 2 — Durée avant de supprimer un device absent des dicts en mémoire
 MEMORY_PURGE_AFTER = 3600.0  # 1 heure
+
+# Nombre max d'échecs consécutifs "adapter not found" avant de quitter
+# proprement et laisser systemd relancer tout le stack BlueZ
+MAX_ADAPTER_FAILURES = 5
 
 
 class BLEPresenceDaemon:
@@ -108,6 +113,9 @@ class BLEPresenceDaemon:
         # FIX 3 — Watchdog : timestamp du dernier callback + signal de restart
         self.last_callback_ts: float = time.time()
         self._need_restart = asyncio.Event()
+
+        # Compteur d'échecs consécutifs "adapter not found"
+        self._adapter_fail_count: int = 0
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -323,8 +331,40 @@ class BLEPresenceDaemon:
             else:
                 await asyncio.sleep(self.watchdog_timeout - silence)
 
+    async def _try_recover_adapter(self) -> bool:
+        """Tente de remonter l'adaptateur via hciconfig down/up.
+        Retourne True si la commande s'est exécutée sans erreur."""
+        log.warning("Adapter %s disappeared — attempting soft reset", self.adapter)
+
+        for cmd in (
+            ["hciconfig", self.adapter, "down"],
+            ["hciconfig", self.adapter, "up"],
+        ):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode != 0:
+                    log.warning(
+                        "hciconfig %s returned %d: %s",
+                        " ".join(cmd[1:]), proc.returncode, stderr.decode().strip(),
+                    )
+                    return False
+            except Exception:
+                log.exception("Failed to run %s", " ".join(cmd))
+                return False
+
+        # Laisse BlueZ le temps de ré-enregistrer l'adaptateur sur D-Bus
+        await asyncio.sleep(3)
+        log.info("Soft reset done, resuming scan")
+        return True
+
     async def _run_scanner_once(self, scanning_mode: str):
-        """Lance le scanner et attend soit l'arrêt, soit un signal de restart."""
+        """Lance le scanner et attend soit l'arrêt, soit un signal de restart.
+        Gère spécifiquement la disparition de l'adaptateur."""
         self._need_restart.clear()
 
         scanner = BleakScanner(
@@ -336,6 +376,7 @@ class BLEPresenceDaemon:
         try:
             async with scanner:
                 log.info("Scanner running on %s", self.adapter)
+                self._adapter_fail_count = 0  # reset dès que le scan démarre
 
                 stop_task = asyncio.create_task(self.stop_event.wait())
                 restart_task = asyncio.create_task(self._need_restart.wait())
@@ -351,6 +392,20 @@ class BLEPresenceDaemon:
                         await t
                     except asyncio.CancelledError:
                         pass
+
+        except BleakError as e:
+            if "not found" in str(e):
+                # L'adaptateur a disparu de BlueZ — tenter une recovery
+                self._adapter_fail_count += 1
+                log.error(
+                    "Adapter %s not found (attempt %d/%d)",
+                    self.adapter, self._adapter_fail_count, MAX_ADAPTER_FAILURES,
+                )
+                if self._adapter_fail_count < MAX_ADAPTER_FAILURES:
+                    await self._try_recover_adapter()
+                # Si on atteint MAX_ADAPTER_FAILURES, run() va sortir de la boucle
+            else:
+                log.exception("BleakError on %s", self.adapter)
 
         except Exception:
             log.exception("Scanner error on %s", self.adapter)
@@ -376,13 +431,26 @@ class BLEPresenceDaemon:
         disappearance_task = asyncio.create_task(self.disappearance_loop())
         watchdog_task = asyncio.create_task(self.watchdog_loop())
 
-        # FIX 3 — Boucle de restart du scanner
+        # Boucle de restart du scanner
         while not self.stop_event.is_set():
             await self._run_scanner_once(scanning_mode)
 
-            if not self.stop_event.is_set():
-                log.info("Restarting scanner in 3s...")
-                await asyncio.sleep(3)
+            if self.stop_event.is_set():
+                break
+
+            # Trop d'échecs consécutifs "adapter not found" : hciconfig n'a pas
+            # suffi. On quitte proprement et on laisse systemd relancer tout le
+            # process (ce qui rejoue ExecStartPre=hciconfig hci0 up et recharge
+            # entièrement le stack BlueZ).
+            if self._adapter_fail_count >= MAX_ADAPTER_FAILURES:
+                log.error(
+                    "Adapter unrecoverable after %d attempts — exiting for systemd restart",
+                    self._adapter_fail_count,
+                )
+                break
+
+            log.info("Restarting scanner in 3s...")
+            await asyncio.sleep(3)
 
         # ── Nettoyage ─────────────────────────────────────────────────────
         for task in (disappearance_task, watchdog_task):
