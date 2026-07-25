@@ -11,6 +11,8 @@ sudo apt install -y python3 python3-venv python3-pip bluetooth bluez rfkill
 sudo systemctl enable --now bluetooth
 rfkill list
 sudo rfkill unblock bluetooth
+systemctl disable bluetooth
+systemctl stop bluetooth
 git clone https://github.com/disk91/ble-scanner.git
 cd ble-scanner
 python3 -m venv .venv
@@ -28,6 +30,49 @@ pip install bleak rich
 source .venv/bin/activate
 python3 ble_daemon.py --adapter hci0 --lost-after 90
 ```
+
+## Configure as a service
+
+In `/etc/systemd/system/ble-daemon.service`
+```
+[Unit]
+Description=BLE Presence Daemon
+# Démarre après que le réseau et BlueZ soient disponibles
+After=network.target bluetooth.target
+# Ne pas démarrer si bluetooth.service plante
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ubuntu/ble-presence
+
+# Remonter hci0 avant de lancer le daemon, au cas où BlueZ l'aurait mis DOWN
+ExecStartPre=/usr/bin/hciconfig hci0 up
+
+ExecStart=/home/ubuntu/ble-presence/.venv/bin/python ble_daemon.py \
+    --db /home/ubuntu/ble-presence/ble_presence.db \
+    --adapter hci0 \
+    --lost-after 30 \
+    --flush-interval 5 \
+    --watchdog-timeout 60
+
+# Relancer automatiquement si le process crash (filet de sécurité)
+Restart=always
+RestartSec=5
+
+# Donner les droits nécessaires pour accéder au hardware BLE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# Logs visibles dans journalctl -u ble-daemon -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Démarre automatiquement en mode multi-utilisateur (boot normal)
+WantedBy=multi-user.target
+```
+
 
 ## Get the results
 
